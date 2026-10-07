@@ -204,8 +204,13 @@ scripts\wsl.cmd ssh
 system/
 ├── backend/                 FastAPI 后端
 │   ├── app/                 主要代码（路由 / 模型 / 调度器 / 执行器 / SSH）
-│   ├── algorithms/          4 个算法脚本（当前是占位实现，协议已定型）
-│   ├── tests/               pytest（76 个用例）
+│   ├── algorithms/          5 个算法脚本（真实实现，协议已定型）
+│   │   ├── hawq_sensitivity.py   ① 权重谱范数敏感度（Hessian 代理）
+│   │   ├── nsga2_search.py       ② pymoo NSGA-II 帕累托方案搜索
+│   │   ├── amct_quantize.py      ④ AMCT 量化（不可用时降级 onnxruntime）
+│   │   ├── amct_onnx_runner.py   ④ 的 AMCT 侧执行器（独立 venv，见 DEPLOY.md）
+│   │   └── atc_convert.py        ⑤ CANN ATC 编译 .om
+│   ├── tests/               pytest（92 个用例）
 │   ├── scripts/
 │   │   ├── wsl.cmd          ★ 在 WSL 里跑后端 / 测试
 │   │   ├── local.cmd        在 Windows 里跑后端 / 测试（旧方式，仍可用）
@@ -264,7 +269,14 @@ system/
 
 ## 十、已知边界
 
-- `algorithms/` 下 4 个脚本是**占位实现**（协议与产物格式已定型，换真实现时前后端不用改）
-- CANN / AMCT / ATC 真实工具链尚未接入
-- **无鉴权**：对外暴露前需要加认证；设备密码当前明文存在 SQLite
-- 服务器内存 1.8G（已配 4G swap），正式跑算法前建议升级实例
+- **量化精度取决于是否装了 AMCT**：
+  - 装了（`deploy.sh amct`）→ 产出 `AscendQuant/AscendDequant` + INT8 权重，
+    最终 `.om` 是**真 INT8**（MobileNetV2 实测 13.3MB → 3.6MB 量化模型 → 6.5MB `.om`）
+  - 没装 → 降级到 onnxruntime QDQ，而 **ATC 不认 QDQ 格式**，
+    最终 `.om` 只能到 FP16 精度（同样模型 → 7.1MB 量化模型 → 9.5MB `.om`）
+- **标定用的是合成数据**（非真实图片），所以页面上的「精度损失」是**估算值**；
+  真精度要在板子上用真实数据集实测
+- **没有昇腾硬件**，`.om` 只验证了格式正确（IMOD 头、ATC 真实编译），
+  没法验证它在真机上跑起来的结果
+- **无用户体系**：只有 API Key 这一道门，设备密码明文存在 SQLite
+- AMCT 与主环境走**两个 venv**（onnxruntime 版本冲突），见 `DEPLOY.md`

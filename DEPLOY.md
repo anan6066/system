@@ -58,7 +58,7 @@ curl -L -O -H "Referer: https://www.hiascend.com/" \
 API_KEY=$(openssl rand -hex 24) ./deploy.sh all
 ```
 
-`all` = 装依赖 → 装 CANN → 构建前端 → 配 systemd。
+`all` = 装依赖 → 装 CANN → **装 AMCT** → 构建前端 → 配服务。
 
 **`API_KEY` 必须设**，否则接口是裸奔的 —— 任何人只要能访问到端口，就能建设备、传模型、删数据，甚至让你的服务器去 SSH 别人的机器。
 
@@ -66,10 +66,37 @@ API_KEY=$(openssl rand -hex 24) ./deploy.sh all
 
 ```bash
 curl http://127.0.0.1:8000/api/health          # 期望 {"status":"ok",...}
-journalctl -u quant-deploy -f                  # 看日志
+journalctl -u quant-deploy -f                  # 看日志（systemd 环境）
+./status.sh                                    # 看日志（容器环境）
 ```
 
 浏览器开 `http://<服务器IP>:8000`（前端已挂在根路径）。
+
+### 5. 关于 AMCT（决定 .om 的精度）
+
+阶段 ④ 的量化有两条路：
+
+| | 装了 AMCT | 没装（降级） |
+| --- | --- | --- |
+| 量化算法 | 华为 AMCT（IFMR）| onnxruntime QDQ |
+| 产物算子 | `AscendQuant/AscendDequant` | `QuantizeLinear/DequantizeLinear` |
+| **ATC 认识吗** | ✅ 认识 | ❌ **不认识 QDQ 格式** |
+| 最终 `.om` | ✅ **INT8** | ⚠️ 只能到 FP16 |
+
+实测差距（MobileNetV2，全 INT8 方案）：
+
+```
+              装了 AMCT        没装
+quantized.onnx   3.6 MB        7.1 MB
+model.om         6.5 MB        9.5 MB    ← 体积差 32%
+```
+
+**AMCT 不需要 NPU** —— 标定推理跑在 CPU 上（onnxruntime + AMCT 自定义算子）。
+但它的自定义算子与 onnxruntime 版本强绑定（只支持到 1.20.0），而主环境用 1.23.2，
+所以 `deploy.sh amct` 会**单独建一个 venv**（`<数据盘>/venvs/amct_onnx`），
+后端用子进程调它。不想要 AMCT 时删掉那个目录即可，量化会自动降级。
+
+单独安装：`./deploy.sh amct`
 
 ---
 
@@ -116,7 +143,10 @@ journalctl -u quant-deploy -f          # 实时日志
 | **ATC 报 `EC0010 ModuleNotFoundError: scipy`（或 numpy）** | **ATC 用的 python3 取决于调用方 shell**：后端走 `bash -lc`，登录 shell 会激活 conda，此时 `python3` 是 conda 的；手动测时又是 `/usr/bin/python3` | `deploy.sh cann` 会给**所有** python3 都装一遍。手动补：`bash -lc "python3 -m pip install scipy numpy sympy cffi pyyaml psutil attrs decorator cython requests absl-py"` |
 | ATC 报 `BrokenPipeError` / `leaked semaphore` | **内存不足**（实测 4GB 必挂） | 升内存到 8GB+，或加 swap |
 | ATC 报 `rtSetSocVersion failed` | `soc_version` 写得不完整 | 必须写全型号：`Ascend310B4` 而不是 `Ascend310B`。合法值见 `<CANN>/x86_64-linux/data/platform_config/*.ini` |
-| ATC 日志里出现「降级为 FP16/FP32 版本重试」 | **ATC 不接受 QDQ 量化图**（已知，非故障） | 这是设计内行为：脚本自动改用 FP16/FP32 版重转，`.om` 仍正常产出 |
+| ATC 日志里出现「降级为 FP16/FP32 版本重试」 | **没装 AMCT**：降级路径产的是 onnxruntime QDQ 图，ATC 不认 | 跑 `./deploy.sh amct`。这是当前唯一能拿到 INT8 `.om` 的途径 |
+| 任务日志出现「AMCT 不可用或失败，降级到 onnxruntime QDQ」 | AMCT venv 缺失或构建失败 | 跑 `./deploy.sh amct`；或 `QUANT_AMCT_PYTHON=<路径>` 手动指定 |
+| AMCT 报 `Layer xxx does not support quantization` | `skip_layers` 里混进了不可量化的节点 | 已修（只传 Conv/Gemm/MatMul/ConvTranspose/AveragePool/LSTM/GRU）。若仍出现，检查该层类型是否在 `amct_onnx/capacity/capacity_config.csv` 的 `QUANTIZABLE_TYPES` 里 |
+| AMCT 构建报 `onnxruntime_float16.h: No such file` | AMCT 的下载脚本只在 ort==v1.16.0 时拉这个头文件，v1.20.0 漏了 | 已修（`deploy.sh amct` 手动补下载，走 jsDelivr 镜像） |
 | 模型上传报「不是合法的 ONNX」 | 上传的文件确实不是 ONNX | 用真实导出的 `.onnx` |
 | 前端页面 401 | 前后端 API Key 不一致 | 两边配成同一个值，重新构建前端 |
 | 前端页面黄条「无法连接后端」 | 后端没起，或跨域被拦 | `./status.sh` 或 `systemctl status`；跨域时把前端来源加进 `config.yaml` 的 `server.cors_origins` |

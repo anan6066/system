@@ -6,9 +6,10 @@
 #      ./deploy.sh check     环境体检，只读不装东西 —— 先跑这个
 #      ./deploy.sh deps      建 venv 并安装 Python 依赖
 #      ./deploy.sh cann      下载并安装 CANN 工具链（ATC 转 .om 必需）
+#      ./deploy.sh amct      安装真实 AMCT（产出带 INT8 的 .om；不装则降级为 FP16）
 #      ./deploy.sh frontend  构建前端并放到后端静态目录（单端口交付）
-#      ./deploy.sh service   注册 systemd 服务（开机自启 + 崩溃重启）
-#      ./deploy.sh all       = deps + cann + frontend + service
+#      ./deploy.sh service   注册服务（有 systemd 用 systemd，容器用 start.sh）
+#      ./deploy.sh all       = deps + cann + amct + frontend + service
 #
 #  可用环境变量覆盖：
 #      APP_DIR      后端目录（默认：脚本所在目录/backend）
@@ -53,6 +54,14 @@ SERVICE_NAME="quant-deploy"
 #     export AutoDLService6006URL=https://uXXXX-XXXX-XXXX.westd.seetacloud.com:8443
 #   把服务跑在 6006 上，那个地址就直接能用，无需在控制台做任何映射。
 PORT="${PORT:-8000}"
+
+# 依赖源（cmd_deps 与 cmd_amct 共用）。国内直连 pypi.org / pytorch.org
+# 基本拉不动，默认走镜像；海外机器覆盖这两个变量即可。
+PIP_INDEX="${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+PIP_FIND_LINKS="${PIP_FIND_LINKS:-https://mirrors.aliyun.com/pytorch-wheels/cpu/}"
+
+# AMCT 专用 venv（onnxruntime 版本与主环境冲突，必须分开）
+AMCT_VENV_DIR="${AMCT_VENV_DIR:-$DATA_DIR/venvs/amct_onnx}"
 CANN_REPO="https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%20${CANN_VER}"
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -190,19 +199,12 @@ cmd_deps() {
     "$VENV_DIR/bin/python" -V
 
     blue "===== 安装依赖（torch 约 200MB）====="
-    # torch 的 +cpu 轮子只在 download.pytorch.org 上，国内实测 29 B/s（等于卡死）。
-    # 默认走国内源：PyPI 用清华，torch 用阿里 pytorch-wheels（实测 11 MB/s）。
-    # 海外机器或想用官方源，覆盖这两个变量即可：
-    #   PIP_INDEX=https://pypi.org/simple PIP_FIND_LINKS= ./deploy.sh deps
-    local pip_index="${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
-    local pip_links="${PIP_FIND_LINKS:-https://mirrors.aliyun.com/pytorch-wheels/cpu/}"
-    echo "PyPI 源: $pip_index"
-    echo "torch 源: $pip_links"
+    echo "PyPI 源: $PIP_INDEX"
+    echo "torch 源: $PIP_FIND_LINKS"
 
     "$VENV_DIR/bin/pip" install -q --upgrade pip
-    # shellcheck disable=SC2086
     "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt" \
-        -i "$pip_index" --find-links "$pip_links" --timeout 60
+        -i "$PIP_INDEX" --find-links "$PIP_FIND_LINKS" --timeout 60
 
     blue "===== 验证关键包 ====="
     "$VENV_DIR/bin/python" - <<'PY'
@@ -307,6 +309,88 @@ cmd_cann() {
     echo "安装包已删；需要重装就重新跑本命令"
 
     green "✓ CANN 装好了。记得把 SOC_VERSION 告诉后端（config.yaml 的 algorithms.soc_version）"
+}
+
+# --------------------------------------------------------------------------- #
+# AMCT（真实量化，产出带 INT8 的 .om）
+#
+# 为什么单独一个 venv：AMCT 的自定义算子（libamct_onnx_ops.so）与 onnxruntime
+# 版本强绑定，只支持到 1.20.0，而主环境用 1.23.2 —— 装不进同一个环境。
+#
+# 为什么用商用包而不是开源仓库：开源版 amct 删掉了 amct_onnx 模块（只剩
+# PyTorch 那条路，且部署层是 NPU 专有算子，CPU 上构造不出来）。商用包的
+# amct_onnx 才是给 ONNX 用的，而且标定全程 CPU，不需要 NPU。
+# --------------------------------------------------------------------------- #
+cmd_amct() {
+    blue "===== 安装真实 AMCT（ONNX 量化）====="
+
+    local amct_ver="${AMCT_VER:-9.1.1}"
+    local pkg_dir="$DATA_DIR/amct-pkg"
+    local venv="$AMCT_VENV_DIR"
+    local url="https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%20${amct_ver}/Ascend-cann-amct_${amct_ver}_linux-x86_64.tar.gz"
+
+    mkdir -p "$pkg_dir"
+    cd "$pkg_dir"
+    if [ ! -f amct_onnx/amct_onnx_op.tar.gz ]; then
+        blue "下载 AMCT 商用包（约 7MB）"
+        curl -L --retry 3 -H "Referer: https://www.hiascend.com/" \
+             -o amct.tar.gz "$url" || die "AMCT 包下载失败"
+        tar xzf amct.tar.gz || die "AMCT 包解压失败"
+    else
+        echo "AMCT 包已存在，跳过下载"
+    fi
+    [ -f amct_onnx/amct_onnx_op.tar.gz ] || die "包里没有 amct_onnx 模块"
+
+    blue "创建 AMCT 专用 venv: $venv"
+    [ -x "$venv/bin/python" ] || "$(resolve_python)" -m venv "$venv"
+    "$venv/bin/pip" install -q --upgrade pip
+    # onnxruntime 必须锁 1.20.0（AMCT 支持列表里最新的一个）
+    "$venv/bin/pip" install -q "onnxruntime==1.20.0" "onnx==1.18.0" \
+        numpy pyyaml protobuf -i "$PIP_INDEX" --timeout 120
+
+    blue "安装 amct_onnx"
+    "$venv/bin/pip" install -q amct_onnx/amct_onnx-*.whl || die "amct_onnx 安装失败"
+
+    blue "构建 AMCT 自定义算子（编译 C++，约 2 分钟）"
+    tar xzf amct_onnx/amct_onnx_op.tar.gz
+    # 补一个头文件：AMCT 的下载脚本只在 ort==v1.16.0 时才拉
+    # onnxruntime_float16.h，但 v1.20.0 的头文件同样 #include 它 —— 缺了编不过。
+    # 优先用国内可达的 jsDelivr 镜像，失败再试 GitHub 原始地址。
+    local inc="$venv/include"
+    mkdir -p "$inc"
+    local base_cn="https://cdn.jsdelivr.net/gh/microsoft/onnxruntime@v1.20.0/include/onnxruntime/core/session"
+    local base_gh="https://raw.githubusercontent.com/microsoft/onnxruntime/v1.20.0/include/onnxruntime/core/session"
+    for f in onnxruntime_c_api.h onnxruntime_cxx_api.h onnxruntime_cxx_inline.h \
+             onnxruntime_session_options_config_keys.h onnxruntime_float16.h; do
+        [ -s "$inc/$f" ] && continue
+        printf "  %-45s " "$f"
+        curl -sL --max-time 60 -o "$inc/$f" "$base_cn/$f" 2>/dev/null
+        if [ ! -s "$inc/$f" ]; then
+            curl -sL --max-time 60 -o "$inc/$f" "$base_gh/$f" 2>/dev/null
+        fi
+        [ -s "$inc/$f" ] && echo "OK" || die "$f 下载失败（内网需放行 jsdelivr 或 github）"
+    done
+
+    cd amct_onnx_op
+    "$venv/bin/python" setup.py install 2>&1 | tail -3
+    rm -rf build
+    cd "$pkg_dir"
+
+    blue "验证"
+    "$venv/bin/python" - <<'PY' || die "AMCT 验证失败"
+import sys
+try:
+    import amct_onnx as amct
+except ImportError as exc:
+    print("导入失败:", exc); sys.exit(1)
+if amct.AMCT_SO is None:
+    print("自定义算子库未加载 —— libamct_onnx_ops.so 缺失或构建失败"); sys.exit(1)
+print("  AMCT", amct.__version__, "就绪（自定义算子已注册）")
+PY
+
+    green "✓ AMCT 装好了（纯 CPU 量化，不需要 NPU）"
+    echo "  后端会自动探测 $venv/bin/python，也可用 QUANT_AMCT_PYTHON 指定"
+    echo "  卸载/禁用：删掉该目录即可，量化会自动降级到 onnxruntime"
 }
 
 # --------------------------------------------------------------------------- #
@@ -521,6 +605,7 @@ EOF
 cmd_all() {
     cmd_deps
     cmd_cann
+    cmd_amct
     cmd_frontend
     cmd_service
     echo
@@ -538,8 +623,9 @@ case "${1:-check}" in
     check)    cmd_check ;;
     deps)     cmd_deps ;;
     cann)     cmd_cann ;;
+    amct)     cmd_amct ;;
     frontend) cmd_frontend ;;
     service)  cmd_service ;;
     all)      cmd_all ;;
-    *)        echo "用法: $0 {check|deps|cann|frontend|service|all}"; exit 1 ;;
+    *)        echo "用法: $0 {check|deps|cann|amct|frontend|service|all}"; exit 1 ;;
 esac

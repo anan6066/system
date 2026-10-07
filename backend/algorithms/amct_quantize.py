@@ -1,28 +1,28 @@
-"""④ 混合精度量化（真实实现）。
+"""④ 混合精度量化（真实 AMCT 实现，带回退）。
 
 输入：workdir/selected_scheme.json（用户选定方案）、workdir/model.onnx；
 产物：workdir/quantized.onnx（真实量化后的 ONNX，契约产物）
-      workdir/quantized_fallback.onnx（FP16/FP32 降级版，仅当 INT8 成功时生成，
-                                       供 ATC 不接受 QDQ 时回退，非契约产物）
+      workdir/quantized_fallback.onnx（仅降级路径产出，见下）
 
-为什么不用 AMCT：开源版 AMCT 只保留了 PyTorch 路径（ONNX 模块已移除），
-且运行态需要昇腾 NPU 驱动与固件 —— 本机没有硬件。所以量化改用 onnxruntime
-的 QDQ（Quantize/Dequantize）静态量化实现，产出的仍是标准 ONNX，ATC 能消费。
+两条路径：
 
-两段式，顺序不能反：
-  Phase A 用 QDQ 静态量化把 INT8 层压成 8bit —— 标定阶段要真实跑前向推理，
-          必须在 FP32 图上做（ORT CPU EP 的 FP16 算子覆盖不全）
-  Phase B 把剩下的 FP16 层权重转成 float16 —— 纯图改写，不做推理
-两者叠加即得"QDQ + FP16"的混合精度模型。
+【主路径】真实 AMCT（华为昇腾模型压缩工具，商用版 amct_onnx）
+    ONNX → create_quant_config → quantize_model（插 IFMR 量化算子）
+         → 标定推理 → save_model → AscendQuant/AscendDequant + INT8 权重
+    产物能被 ATC 直接编译成带 INT8 的 .om。全程 CPU，不需要 NPU。
 
-标定数据是按输入张量形状合成的确定性数据（固定种子、图像形用正弦网格）。
-它只能保证量化范围有值且可复现，**不代表真实精度** —— 精度损失仍是估算口径。
+【降级路径】onnxruntime QDQ
+    AMCT 不可用（没装 / 版本不符）时使用。产物是标准 QDQ ONNX，
+    但 **ATC 不认识 QDQ 算子**，所以最终 .om 只能拿到 FP16 的压缩率。
+    这条路径同时留一份 FP16 版本供 ATC 回退，避免产出"完全没量化"的 .om。
 
-依赖缺失（Windows 的 tools/py38 没有 onnxruntime）时回退为复制 model.onnx，
-保持演示链路可用。
+为什么 AMCT 要单独开进程：它的自定义算子与 onnxruntime 版本强绑定
+（只支持 ≤1.20.0），而主环境用 1.23.2，两者装不进同一个 venv。
 """
 import json
+import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -31,8 +31,22 @@ STAGE = "quantizing"
 SLEEP = 0.15
 CALIB_SEED = 1234
 DEFAULT_SAMPLES = 32
-# onnxruntime 1.23 只认到 IR 11；onnx>=1.19 导出的模型默认写更高的版本
 ORT_MAX_IR_VERSION = 10
+
+BIT_ORDER = {"INT8": 0, "FP16": 1, "FP32": 2}   # 越大越保守
+
+# AMCT 认可的量化层类型，取自 amct_onnx/capacity/capacity_config.csv 的
+# QUANTIZABLE_TYPES。它的 skip_layers 校验很反直觉：**只接受"本来可量化"的层**，
+# 传个 Relu/Add 进去会直接报 "Layer xxx does not support quantization"。
+AMCT_QUANTIZABLE = {"Conv", "Gemm", "MatMul", "ConvTranspose",
+                    "AveragePool", "LSTM", "GRU"}
+
+# AMCT 专用 venv 的 python；可用环境变量覆盖
+AMCT_PYTHON_CANDIDATES = [
+    "/root/autodl-tmp/venvs/amct_onnx/bin/python",
+    os.path.expanduser("~/amct-venv/bin/python"),
+    "/opt/amct-venv/bin/python",
+]
 
 try:
     import numpy as np
@@ -44,12 +58,21 @@ try:
 except ImportError:  # pragma: no cover - 只在无 onnxruntime 的环境走到
     HAS_ORT = False
 
-BIT_ORDER = {"INT8": 0, "FP16": 1, "FP32": 2}   # 越大越保守
-
 
 def emit(percent: int, message: str) -> None:
     print(json.dumps({"stage": STAGE, "percent": percent, "message": message},
                      ensure_ascii=False), flush=True)
+
+
+def find_amct_python():
+    """定位装有 AMCT 的 python；找不到返回 None。"""
+    explicit = os.environ.get("QUANT_AMCT_PYTHON")
+    if explicit:
+        return explicit if os.path.exists(explicit) else None
+    for candidate in AMCT_PYTHON_CANDIDATES:
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 
 def read_selected(workdir: Path):
@@ -134,13 +157,86 @@ def build_node_bits(model, layer_config, layer_names):
                 current = node_bits.get(node_name)
                 if current is None or BIT_ORDER[bit] > BIT_ORDER[current]:
                     node_bits[node_name] = bit
-
-    int8_nodes = sorted(n for n, b in node_bits.items() if b == "INT8")
-    fp16_nodes = sorted(n for n, b in node_bits.items() if b == "FP16")
-    fp32_nodes = sorted(n for n, b in node_bits.items() if b == "FP32")
-    return int8_nodes, fp16_nodes, fp32_nodes
+    return node_bits
 
 
+# --------------------------------------------------------------------------- #
+# 主路径：真实 AMCT
+# --------------------------------------------------------------------------- #
+def run_with_amct(workdir: Path, amct_python: str, model, layer_config,
+                  layer_names) -> bool:
+    """调 AMCT 子进程量化；成功返回 True。"""
+    node_bits = build_node_bits(model, layer_config, layer_names)
+    # skip_layers 只能装"方案要求非 INT8"且"类型本来可量化"的节点：
+    # 非量化类型（Relu/Add/...）AMCT 自己会跳过，列进去反而报错。
+    quantizable = {node.name for node in model.graph.node
+                   if node.op_type in AMCT_QUANTIZABLE}
+    skip_nodes = sorted(name for name, bit in node_bits.items()
+                        if bit != "INT8" and name in quantizable)
+
+    declare = model.graph.input
+    input_name = declare[0].name if declare else "images"
+    input_shape = [int(d.dim_value) if d.dim_value > 0 else 1
+                   for d in declare[0].type.tensor_type.shape.dim] if declare else [1, 3, 224, 224]
+    if not input_shape:
+        input_shape = [1, 3, 224, 224]
+
+    samples = _env_int("CALIBRATION_SAMPLES", DEFAULT_SAMPLES)
+    job_path = workdir / "_amct_job.json"
+    job_path.write_text(json.dumps({
+        "input_name": input_name,
+        "input_shape": input_shape,
+        "skip_nodes": skip_nodes,
+        "samples": samples,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    emit(15, "使用真实 AMCT 量化（INT8 层 %d 个 / 跳过 %d 个节点）"
+         % (sum(1 for v in node_bits.values() if v == "INT8"), len(skip_nodes)))
+
+    runner = Path(__file__).resolve().parent / "amct_onnx_runner.py"
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    proc = subprocess.Popen(
+        [amct_python, str(runner), str(workdir)],
+        cwd=str(workdir), env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace")
+
+    stderr_tail = []
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue          # AMCT 自己的日志行，忽略
+        percent = payload.get("percent")
+        message = payload.get("message")
+        if percent is not None and message:
+            # 把子进程 10~100 的进度映射到主流程的 20~85
+            mapped = int(20 + (float(percent) / 100.0) * 65)
+            emit(mapped, str(message))
+
+    for line in proc.stderr:
+        stderr_tail.append(line.rstrip())
+        if len(stderr_tail) > 50:
+            stderr_tail.pop(0)
+    proc.wait()
+
+    if proc.returncode != 0:
+        print("AMCT 量化失败（退出码 %d）" % proc.returncode, file=sys.stderr)
+        for line in stderr_tail[-20:]:
+            print(line, file=sys.stderr)
+        return False
+    return (workdir / "quantized.onnx").exists()
+
+
+# --------------------------------------------------------------------------- #
+# 降级路径：onnxruntime QDQ + FP16
+# --------------------------------------------------------------------------- #
 class SyntheticCalibrationReader(CalibrationDataReader):
     """按模型输入形状合成确定性标定数据。"""
 
@@ -159,7 +255,6 @@ class SyntheticCalibrationReader(CalibrationDataReader):
 
     @staticmethod
     def _tensor(rng, shape):
-        # 4D 按图像处理：正弦网格比纯随机噪声更接近真实激活分布
         if len(shape) == 4:
             batch, channels, height, width = shape
             rows = np.linspace(0.0, np.pi, max(height, 1), dtype=np.float32)
@@ -184,7 +279,6 @@ class SyntheticCalibrationReader(CalibrationDataReader):
 
 
 def normalize_ir_version(source: Path, target: Path) -> Path:
-    """把 IR 版本压到 onnxruntime 能接受的范围内；不需要压时直接返回原路径。"""
     model = onnx.load(str(source), load_external_data=False)
     if model.ir_version <= ORT_MAX_IR_VERSION:
         return source
@@ -193,24 +287,8 @@ def normalize_ir_version(source: Path, target: Path) -> Path:
     return target
 
 
-def run_qdq(source: Path, target: Path, model, int8_nodes, samples):
-    reader = SyntheticCalibrationReader(model, samples)
-    quantize_static(str(source), str(target), reader,
-                    quant_format=QuantFormat.QDQ,
-                    per_channel=True,
-                    activation_type=QuantType.QUInt8,
-                    weight_type=QuantType.QInt8,
-                    nodes_to_quantize=int8_nodes or None)
-    return onnx.load(str(target))
-
-
 def topo_sort_graph(model) -> bool:
-    """把 graph.node 重排成拓扑序；成功返回 True。
-
-    convert_float_to_float16(keep_io_types=True) 会在图输入处插 Cast 节点，
-    但它把这些节点追加到节点表末尾，于是先于生产者被消费 —— onnx.checker 会报
-    "Nodes in a graph must be topologically sorted"。这里重排一遍修掉。
-    """
+    """把 graph.node 重排成拓扑序（FP16 转换会打乱顺序）。"""
     nodes = list(model.graph.node)
     available = {init.name for init in model.graph.initializer}
     available |= {value.name for value in model.graph.input}
@@ -247,27 +325,90 @@ def run_fp16(source_path: Path, target: Path, blocked):
     onnx.save(converted, str(target))
 
 
-def has_qdq_nodes(path: Path) -> bool:
+def run_with_ort(workdir: Path, model, layer_config, layer_names) -> bool:
+    """onnxruntime QDQ（+ FP16 兜底）。成功返回 True。"""
+    source = workdir / "model.onnx"
+    target = workdir / "quantized.onnx"
+    fallback = workdir / "quantized_fallback.onnx"
+
+    node_bits = build_node_bits(model, layer_config, layer_names)
+    int8_nodes = sorted(n for n, b in node_bits.items() if b == "INT8")
+    fp16_nodes = sorted(n for n, b in node_bits.items() if b == "FP16")
+    fp32_nodes = sorted(n for n, b in node_bits.items() if b == "FP32")
+
+    emit(25, "定位待量化节点：INT8 %d 个 / FP16 %d 个 / FP32 %d 个"
+         % (len(int8_nodes), len(fp16_nodes), len(fp32_nodes)))
+
+    if not int8_nodes and not fp16_nodes:
+        emit(60, "方案未要求 INT8/FP16，直接输出 FP32 原模型")
+        shutil.copyfile(str(source), str(target))
+        return True
+
+    samples = _env_int("CALIBRATION_SAMPLES", DEFAULT_SAMPLES)
+    staged = normalize_ir_version(source, workdir / "_quant_src.onnx")
+    mixed_ok = False
+
+    if int8_nodes:
+        emit(40, "插入 QDQ 量化算子并用 %d 个合成样本校准（INT8 层）" % samples)
+        try:
+            qdq_path = workdir / "_quant_qdq.onnx"
+            quantize_static(str(staged), str(qdq_path),
+                            SyntheticCalibrationReader(model, samples),
+                            quant_format=QuantFormat.QDQ, per_channel=True,
+                            activation_type=QuantType.QUInt8, weight_type=QuantType.QInt8,
+                            nodes_to_quantize=int8_nodes or None)
+            emit(55, "QDQ 量化完成，开始 FP16 图改写")
+            run_fp16(qdq_path, target, set(fp32_nodes) | set(int8_nodes))
+            mixed_ok = True
+            qdq_path.unlink(missing_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            emit(55, "QDQ 混合精度失败（%s），降级为 FP16 重试" % type(exc).__name__)
+
+    if not mixed_ok and fp16_nodes:
+        try:
+            run_fp16(staged, target, set(fp32_nodes))
+            mixed_ok = True
+        except Exception as exc:  # noqa: BLE001
+            emit(70, "FP16 转换失败（%s），降级为原模型" % type(exc).__name__)
+
+    if not mixed_ok:
+        shutil.copyfile(str(staged), str(target))
+        emit(80, "量化失败，已按原模型输出（FP32）")
+
+    # 只要做了 INT8，就留一份 FP16 版本给 ATC 兜底（ATC 不吃 QDQ 图）
+    if mixed_ok and int8_nodes:
+        try:
+            run_fp16(staged, fallback, set())
+        except Exception:  # noqa: BLE001
+            try:
+                shutil.copyfile(str(staged), str(fallback))
+            except Exception:  # noqa: BLE001
+                fallback.unlink(missing_ok=True)
+
+    if staged != source:
+        staged.unlink(missing_ok=True)
+    return True
+
+
+def _env_int(name: str, default: int) -> int:
     try:
-        model = onnx.load(str(path), load_external_data=False)
-    except Exception:  # noqa: BLE001
-        return False
-    return any(node.op_type in ("QuantizeLinear", "DequantizeLinear")
-               for node in model.graph.node)
+        value = int(str(os.environ.get(name, "")).strip())
+        return value if value > 0 else default
+    except (TypeError, ValueError):
+        return default
 
 
 def main() -> None:
     workdir = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
     source = workdir / "model.onnx"
     target = workdir / "quantized.onnx"
-    fallback = workdir / "quantized_fallback.onnx"
 
     index, config = read_selected(workdir)
     int8_wanted = sum(1 for value in config.values() if value == "INT8")
 
     if not HAS_ORT or not source.exists():
         reason = "未找到 model.onnx" if not source.exists() else "缺少 onnxruntime 依赖"
-        emit(10, "AMCT 按方案 #%s 量化（降级：%s，直接透传原模型）" % (index, reason))
+        emit(10, "量化（降级：%s，直接透传原模型）" % reason)
         time.sleep(SLEEP)
         emit(45, "插入量化算子并校准（跳过）")
         time.sleep(SLEEP)
@@ -281,7 +422,7 @@ def main() -> None:
         time.sleep(SLEEP)
         return
 
-    emit(10, "读取方案 #%s：%d 层，其中 INT8 %d 层" % (index, len(config), int8_wanted))
+    emit(5, "读取方案 #%s：%d 层，其中 INT8 %d 层" % (index, len(config), int8_wanted))
     time.sleep(SLEEP)
 
     try:
@@ -290,95 +431,58 @@ def main() -> None:
         print("model.onnx 解析失败: %s" % exc, file=sys.stderr)
         raise SystemExit(2)
 
-    layer_names = read_layer_names(workdir)
-    if not layer_names:
-        layer_names = sorted(config)
-    int8_nodes, fp16_nodes, fp32_nodes = build_node_bits(model, config, layer_names)
-    emit(25, "定位待量化节点：INT8 %d 个 / FP16 %d 个 / FP32 %d 个"
-         % (len(int8_nodes), len(fp16_nodes), len(fp32_nodes)))
-    time.sleep(SLEEP)
+    layer_names = read_layer_names(workdir) or sorted(config)
 
-    if not int8_nodes and not fp16_nodes:
-        emit(60, "方案未要求 INT8/FP16，直接输出 FP32 原模型")
-        shutil.copyfile(str(source), str(target))
-        emit(100, "量化完成（全 FP32）")
-        time.sleep(SLEEP)
-        return
-
-    samples = int(_env_int("CALIBRATION_SAMPLES", DEFAULT_SAMPLES))
-    staged = normalize_ir_version(source, workdir / "_quant_src.onnx")
-    mixed_ok = False
-
-    # 目标路径：QDQ(INT8) + FP16
-    if int8_nodes:
-        emit(40, "插入 QDQ 量化算子并用 %d 个合成样本校准（INT8 层）" % samples)
-        time.sleep(SLEEP)
+    # ---- 优先真实 AMCT ----
+    # 方案里没有 INT8 层就别走 AMCT：跳过全部层的话它会报
+    # "no layer need to quantize"，而纯 FP16/FP32 用 ort 路径更直接。
+    amct_python = find_amct_python() if int8_wanted else None
+    if amct_python:
         try:
-            qdq_path = workdir / "_quant_qdq.onnx"
-            run_qdq(staged, qdq_path, model, int8_nodes, samples)
-            emit(55, "QDQ 量化完成，开始 FP16 图改写")
-            time.sleep(SLEEP)
-            run_fp16(qdq_path, target, set(fp32_nodes) | set(int8_nodes))
-            mixed_ok = True
-            qdq_path.unlink(missing_ok=True)
+            if run_with_amct(workdir, amct_python, model, config, layer_names):
+                if _validate(target, strict=False):
+                    emit(92, "AMCT 量化完成（AscendQuant/Dequant + INT8 权重）")
+                    time.sleep(SLEEP)
+                    emit(100, "量化完成")
+                    time.sleep(SLEEP)
+                    return
+                print("AMCT 产物校验未通过，回退到 onnxruntime", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
-            emit(55, "QDQ 混合精度失败（%s），降级为 FP16 重试" % type(exc).__name__)
-            time.sleep(SLEEP)
-
-    if not mixed_ok and fp16_nodes:
-        try:
-            run_fp16(staged, target, set(fp32_nodes))
-            mixed_ok = True
-        except Exception as exc:  # noqa: BLE001
-            emit(70, "FP16 转换失败（%s），降级为原模型" % type(exc).__name__)
-            time.sleep(SLEEP)
-
-    if not mixed_ok:
-        shutil.copyfile(str(staged), str(target))
-        emit(80, "量化失败，已按原模型输出（FP32）")
+            print("AMCT 路径异常，回退到 onnxruntime: %s" % exc, file=sys.stderr)
+        emit(20, "AMCT 不可用或失败，降级到 onnxruntime QDQ")
         time.sleep(SLEEP)
 
-    # 产物必须是合法 ONNX，否则如实失败
-    try:
-        produced = onnx.load(str(target), load_external_data=False)
-        onnx.checker.check_model(produced)
-    except Exception as exc:  # noqa: BLE001
-        print("量化产物不是合法 ONNX: %s" % exc, file=sys.stderr)
+    # ---- 降级：onnxruntime ----
+    run_with_ort(workdir, model, config, layer_names)
+
+    if not _validate(target):
+        print("量化产物不是合法 ONNX", file=sys.stderr)
         raise SystemExit(2)
 
-    # 只要做了 INT8，就另留一份 FP16 版本给 ATC 兜底。
-    #
-    # 为什么不能只复制原模型：ATC 目前不接受 QDQ(INT8) 图（CANN 里没有
-    # DequantizeLinear 插件），降级时要用这份。若方案是"全 INT8"、没有 FP16 层，
-    # 按原逻辑会复制未量化的原模型 —— 用户拿到一个体积完全没变的 .om，
-    # 与方案里承诺的压缩率对不上。这里统一转成 FP16：压缩做不到方案承诺的
-    # 那么多，但至少真的压了。
-    if mixed_ok and int8_nodes:
-        try:
-            run_fp16(staged, fallback, set())
-        except Exception:  # noqa: BLE001 - 降级料缺失不影响主产物
-            try:
-                shutil.copyfile(str(staged), str(fallback))
-            except Exception:  # noqa: BLE001
-                fallback.unlink(missing_ok=True)
-
-    if staged != source:
-        staged.unlink(missing_ok=True)
-
-    actual_int8 = sum(1 for node in produced.graph.node if node.op_type == "QuantizeLinear")
-    emit(90, "写回量化权重（请求 INT8 %d 个，实际插入 QuantizeLinear %d 个）"
-         % (len(int8_nodes), actual_int8))
+    emit(92, "写回量化权重（onnxruntime QDQ 路径）")
     time.sleep(SLEEP)
     emit(100, "量化完成")
     time.sleep(SLEEP)
 
 
-def _env_int(name: str, default: int) -> int:
+def _validate(path: Path, strict: bool = True) -> bool:
+    """校验产物是不是合法 ONNX。
+
+    strict=False 用于 AMCT 产物：它含 AscendQuant/AscendDequant 这些华为自定义
+    算子，onnx.checker 不认识会直接报错 —— 但那是好产物，只是超出标准 ONNX 的
+    算子集。这时只验证能否作为 ONNX protobuf 读出来。
+    """
     try:
-        value = int(str(__import__("os").environ.get(name, "")).strip())
-        return value if value > 0 else default
-    except (TypeError, ValueError):
-        return default
+        produced = onnx.load(str(path), load_external_data=False)
+    except Exception:  # noqa: BLE001
+        return False
+    if not strict:
+        return len(produced.graph.node) > 0
+    try:
+        onnx.checker.check_model(produced)
+    except Exception:  # noqa: BLE001
+        return False
+    return True
 
 
 if __name__ == "__main__":

@@ -5,8 +5,10 @@
 （HAWQ 敏感度 → NSGA-II 位宽方案搜索 → 用户选帕累托方案 → AMCT 量化 → ATC 转 `.om`）、
 `.om` 下载、SFTP 部署推送与性能指标回填、首页统计与量化效果对比。
 
-> 算法目前是**占位实现**（协议与产物格式已定型，换真实现时前端与接口都不用改）；
-> 详见 `docs/API_CONTRACT.md` 第 7 节。
+> 算法**已是真实实现**：敏感度用权重谱范数（Hessian 代理）、方案搜索用 pymoo
+> 的 NSGA-II、量化用华为 AMCT（未安装时降级到 onnxruntime QDQ，但那样 `.om`
+> 只能到 FP16）、`.om` 由 CANN ATC 真实编译。详见 `docs/API_CONTRACT.md` 第 7 节
+> 与根目录的 `DEPLOY.md`。
 
 ## 目录结构
 
@@ -26,12 +28,13 @@ backend/
 │   ├── metrics.py         # 性能指标估算（占位口径，与算法脚本一致）
 │   ├── presets.py         # 预设模型定义（与前端预设下拉一致）
 │   └── routers/           # devices / models / jobs / deployments / stats / comparison
-├── algorithms/            # 4 个占位算法脚本（独立进程，不与 Web 共享代码）
-│   ├── hawq_sensitivity.py    # ① 敏感度分析 → sensitivity.json
-│   ├── nsga2_search.py        # ② 位宽方案搜索 → schemes.json
-│   ├── amct_quantize.py       # ④ 量化 → quantized.onnx
-│   └── atc_convert.py         # ⑤ 转 .om → model.om
-├── tests/                 # pytest（76 个用例，覆盖 API/状态机/执行器/算法脚本/端到端）
+├── algorithms/            # 算法脚本（独立进程，不与 Web 共享代码）
+│   ├── hawq_sensitivity.py    # ① 敏感度分析（权重谱范数）→ sensitivity.json
+│   ├── nsga2_search.py        # ② pymoo NSGA-II 方案搜索 → schemes.json
+│   ├── amct_quantize.py       # ④ AMCT 量化（不可用时降级 ort）→ quantized.onnx
+│   ├── amct_onnx_runner.py    # ④ 的 AMCT 侧执行器（跑在独立 venv 里）
+│   └── atc_convert.py         # ⑤ CANN ATC 编译 → model.om
+├── tests/                 # pytest（92 个用例，覆盖 API/状态机/执行器/算法脚本/端到端）
 ├── scripts/smoke_http.py  # 对着运行中的服务跑完整 HTTP 链路自检（20 项）
 ├── docs/API_CONTRACT.md   # 前后端对接契约（真实响应示例 + 前端改造清单）
 ├── config.yaml            # 配置
@@ -177,8 +180,10 @@ python algorithms/xxx.py <workdir>      # cwd = workdir
 
 ## 待办 / 已知边界
 
-- 真实 HAWQ（PyTorch）、NSGA-II（pymoo）替换 `algorithms/` 下占位脚本
-- CANN/AMCT/ATC 工具链（Linux）接入，替换 ④⑤ 两个占位脚本
-- 无鉴权：对外暴露前需加认证；设备密码当前明文存 SQLite
-- 服务器内存 1.8G（已配 4G swap），正式跑算法前建议升级实例
+- **精度取决于是否装了 AMCT**：装了 → `.om` 是真 INT8；没装 → 降级 onnxruntime
+  QDQ，而 ATC 不认 QDQ 格式，`.om` 只能到 FP16。AMCT 安装见根目录 `DEPLOY.md`
+- **标定用合成数据**，页面上的「精度损失」是估算值，真精度要在板子上实测
+- **无昇腾硬件**，`.om` 只验证了格式（IMOD 头、ATC 真实编译），没验证真机运行结果
+- 无用户体系：只有 API Key 一道门；设备密码明文存 SQLite
+- 真实 HAWQ（PyTorch 反传算 Hessian）尚未接入，当前用谱范数代理
 - 联调需在阿里云安全组放行 8000 端口

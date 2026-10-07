@@ -126,8 +126,31 @@ def test_nsga2_is_deterministic(tmp_path):
 # --------------------------------------------------------------------------- #
 # ④ 量化
 # --------------------------------------------------------------------------- #
+def _amct_python():
+    """本机是否装了 AMCT（决定量化产物长什么样）。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_aq", ALGO / "amct_quantize.py")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:  # noqa: BLE001
+        return None
+    return module.find_amct_python()
+
+
+AMCT_PYTHON = _amct_python()
+HAS_AMCT = AMCT_PYTHON is not None
+
+
 @requires_toolchain
 def test_amct_quantizes_real_onnx(tmp_path):
+    """INT8 量化产物。
+
+    装了 AMCT → 华为自己的 AscendQuant/AscendDequant + INT8 权重，
+                  ATC 认这个格式，最终 .om 里是真 INT8。
+    没装 AMCT → onnxruntime QDQ 降级，ATC 不认，最终 .om 只能到 FP16。
+    """
     _write_tiny(tmp_path)
     (tmp_path / "selected_scheme.json").write_text(json.dumps({
         "index": 1,
@@ -142,13 +165,20 @@ def test_amct_quantizes_real_onnx(tmp_path):
     assert progress[-1] == ("quantizing", 100, "量化完成")
 
     produced = onnx.load(str(tmp_path / "quantized.onnx"))
-    onnx.checker.check_model(produced)
     ops = {node.op_type for node in produced.graph.node}
-    # INT8 层插入了 QDQ 算子，FP16 层权重被转成 half
-    assert "QuantizeLinear" in ops and "DequantizeLinear" in ops
     dtypes = {init.data_type for init in produced.graph.initializer}
-    assert onnx.TensorProto.FLOAT16 in dtypes
-    assert onnx.TensorProto.FLOAT in dtypes          # fc1 被挡住，保持 FP32
+
+    if HAS_AMCT:
+        assert "AscendQuant" in ops and "AscendDequant" in ops, \
+            "AMCT 产物应带华为量化算子"
+        assert onnx.TensorProto.INT8 in dtypes, "AMCT 产物应有 INT8 权重"
+    else:
+        # AMCT 产物含自定义算子，onnx.checker 不认识，只在降级路径校验
+        onnx.checker.check_model(produced)
+        assert "QuantizeLinear" in ops and "DequantizeLinear" in ops
+        assert onnx.TensorProto.FLOAT16 in dtypes
+        assert onnx.TensorProto.FLOAT in dtypes      # fc1 被挡住，保持 FP32
+
     # 产物不再是原模型的字节副本
     assert (tmp_path / "quantized.onnx").read_bytes() != build_tiny_onnx()
 
@@ -176,12 +206,12 @@ def test_amct_without_model_degrades(tmp_path):
 
 
 @requires_toolchain
-def test_amct_all_int8_produces_compressed_fallback(tmp_path):
-    """全 INT8 方案也得留一份**真压缩过**的兜底模型。
+def test_amct_all_int8_produces_usable_artifact(tmp_path):
+    """全 INT8 方案的产物必须真的能用。
 
-    ATC 不接受 QDQ(INT8) 图，转 .om 时必然降级。若兜底是未量化的原模型，
-    用户拿到的 .om 体积就跟方案承诺的压缩率完全对不上（曾经就是这样）。
-    这里锁住：兜底必须是 FP16，且不等于原模型。
+    装了 AMCT → 产物是 AscendQuant 部署模型，ATC 直接认，不需要兜底文件。
+    没装 AMCT → 降级路径的 QDQ 图 ATC 不认，必须留一份 FP16 兜底，
+                否则用户拿到的 .om 体积跟方案承诺的压缩率完全对不上。
     """
     _write_tiny(tmp_path)
     (tmp_path / "selected_scheme.json").write_text(json.dumps({
@@ -196,15 +226,21 @@ def test_amct_all_int8_produces_compressed_fallback(tmp_path):
     quantized = tmp_path / "quantized.onnx"
     fallback = tmp_path / "quantized_fallback.onnx"
     assert quantized.exists(), "INT8 主产物缺失"
-    assert fallback.exists(), "全 INT8 方案没有产出兜底模型"
 
     produced = onnx.load(str(quantized))
-    assert any(node.op_type == "QuantizeLinear" for node in produced.graph.node)
+    dtypes = {init.data_type for init in produced.graph.initializer}
 
-    backup = onnx.load(str(fallback))
-    dtypes = {init.data_type for init in backup.graph.initializer}
-    assert onnx.TensorProto.FLOAT16 in dtypes, "兜底模型没被压成 FP16"
-    assert fallback.read_bytes() != build_tiny_onnx(), "兜底模型是原模型副本，等于没压"
+    if HAS_AMCT:
+        assert "AscendQuant" in {n.op_type for n in produced.graph.node}
+        assert onnx.TensorProto.INT8 in dtypes, "AMCT 产物应有 INT8 权重"
+        # AMCT 产物 ATC 直接认，不需要 FP16 兜底
+    else:
+        assert fallback.exists(), "降级路径必须留 FP16 兜底模型"
+        assert any(n.op_type == "QuantizeLinear" for n in produced.graph.node)
+        backup = onnx.load(str(fallback))
+        backup_dtypes = {init.data_type for init in backup.graph.initializer}
+        assert onnx.TensorProto.FLOAT16 in backup_dtypes, "兜底模型没被压成 FP16"
+        assert fallback.read_bytes() != build_tiny_onnx(), "兜底模型是原模型副本，等于没压"
 
 
 # --------------------------------------------------------------------------- #
