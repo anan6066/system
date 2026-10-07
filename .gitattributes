@@ -1,0 +1,26 @@
+# 行尾规范
+#
+# 背景：项目在 Windows 上开发、部署到 Linux。若 shell 脚本被检出成 CRLF，
+# 传到服务器会直接报 "bash: bad interpreter: /bin/bash^M"。
+# 这里强制脚本类文件始终用 LF。
+
+* text=auto eol=lf
+
+# Windows 批处理反而需要 CRLF
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制文件不要做行尾/编码转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.doc binary
+*.xls binary
+*.onnx binary
+*.om binary
+*.db binary
+*.so binary
+*.pyd binary
+*.dll binary
+*.zip binary
+*.gz binary
