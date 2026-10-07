@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+workspace/
+presets_cache/
+app.db
+app.db-journal
+app.db-wal
+nohup.out
+*.log

@@ -1,0 +1,50 @@
+# ============================================================================
+#  智能模型量化部署一体化平台 — 后端依赖
+#
+#  安装（CPU 环境，默认）：
+#      pip install -r requirements.txt
+#
+#  想要 GPU（跑真实 HAWQ / 加速标定推理），把下面两行 torch 换成 CUDA 版：
+#      pip install torch==2.7.1 torchvision==0.22.1 \
+#        --index-url https://download.pytorch.org/whl/cu128
+#  cu128 是给 RTX 50 系（Blackwell / sm_120）用的；40 系及更早可用 cu124。
+#  装完 torch 后本文件其余部分照常 pip install -r 即可（它会跳过已装的 torch）。
+# ============================================================================
+
+# ---- Web 服务 ----
+fastapi>=0.115,<0.116
+pydantic>=2.7,<2.10
+sqlmodel>=0.0.22,<0.0.23
+uvicorn[standard]>=0.30
+paramiko>=3.4
+cryptography<44
+pyyaml>=6.0
+python-multipart>=0.0.9
+pytest>=8.0
+httpx>=0.27,<0.28
+
+# ---- 算法（真实实现，之前缺失；缺了量化任务会在第 ① 步就失败）----
+# ① 敏感度   numpy 幂迭代求谱范数
+# ② 方案搜索 pymoo 跑 NSGA-II
+# ④ 量化     onnxruntime 做 QDQ + FP16 混合精度
+# ⑤ 转 .om   调 CANN 的 atc（不属于 Python 依赖，见 ../DEPLOY.md）
+numpy>=1.26,<3
+onnx>=1.16
+onnxruntime>=1.20
+pymoo>=0.6.2
+
+# ---- torch：预设模型导出用 ----
+# ⚠ 单独说明：torch 的 +cpu 轮子只在 download.pytorch.org 上，而国内基本拉不动
+#   （实测 29 B/s，会卡死）。deploy.sh 已配好国内源，直接跑它即可：
+#
+#       ./deploy.sh deps
+#
+#   手动装的话用这套（阿里镜像实测 11 MB/s）：
+#       pip install -r requirements.txt \
+#         -i https://pypi.tuna.tsinghua.edu.cn/simple \
+#         --find-links https://mirrors.aliyun.com/pytorch-wheels/cpu/
+#
+#   要 GPU 版（真实 HAWQ 用）就把上面的 find-links 换成 cu128：
+#       --find-links https://mirrors.aliyun.com/pytorch-wheels/cu128/
+torch==2.7.1+cpu
+torchvision==0.22.1+cpu

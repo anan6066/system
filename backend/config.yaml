@@ -1,0 +1,44 @@
+# 智能模型量化部署一体化平台 — 后端配置
+# 所有路径均相对仓库根目录（除非是绝对路径）
+
+workspace_dir: workspace          # 任务工作目录根：上传模型 / 方案 JSON / .om 产物
+db_path: app.db                   # SQLite 数据库
+max_upload_mb: 500                # ONNX 上传大小上限
+
+# 四个阶段的算法脚本（真实实现替换同名文件即可，协议与产物格式不变）
+algorithms:
+  hawq_script: algorithms/hawq_sensitivity.py
+  nsga2_script: algorithms/nsga2_search.py
+  amct_script: algorithms/amct_quantize.py
+  atc_script: algorithms/atc_convert.py
+  soc_version: Ascend310B4        # ATC 目标芯片（Atlas 200I DK A2）；也可用环境变量 SOC_VERSION 覆盖
+  calibration_samples: 32         # 量化标定用的合成样本数（注入 CALIBRATION_SAMPLES）
+
+ssh:
+  timeout: 10                     # SSH 连接/命令超时（秒）
+  metrics_cpu_command: "top -bn1 | grep -i '%Cpu'"
+  metrics_mem_command: "free -m | awk '/Mem:/ {printf \"%.1f\", $3/$2*100}'"
+  metrics_npu_command: "npu-smi info 2>/dev/null | head -20"
+
+scheduler:
+  max_concurrent_jobs: 1          # 服务器内存小，勿调高
+  cancel_grace_seconds: 5         # 取消时先 SIGTERM 等待，超时才强杀
+
+deployment:
+  default_target_dir: /data/models   # 前端未指定目标目录时的默认推送目录
+  bench_command: ""                  # 留空 = 跳过真机推理测试，用方案目标值估算指标
+  bench_timeout: 60
+  keep_device_busy: false            # 部署结束后是否保留设备 busy 状态
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  # API 鉴权：留空 = 不鉴权（仅限本机开发）。
+  # 对外部署务必设置，推荐用环境变量 QUANT_DEPLOY_API_KEY（优先级高于这里），
+  # 免得密钥跟着 config.yaml 一起进版本库。前端配同一个值到 VITE_API_KEY。
+  api_key: ""
+  cors_origins:                       # 前端 dev server 跨域（也可用 vite proxy）
+    - "http://localhost:5173"
+    - "http://127.0.0.1:5173"
+    - "http://localhost:3080"
+    - "http://127.0.0.1:3080"
